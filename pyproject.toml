@@ -1,0 +1,12 @@
+[project]
+name = "ethernot"
+version = "0.1.0"
+description = "Simple. anyonymous chat app where messages are never saved to a disk. Ever."
+readme = "README.md"
+requires_python = ">=3.12"
+dependencies = []
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+
+[build-system]
+todo = "..."

@@ -1,6 +1,6 @@
 [project]
 name = "ethernot"
-version = "0.1.5"
+version = "0.1.6"
 description = "Simple, anyonymous chat app where messages are never saved to a disk. Ever."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -13,7 +13,7 @@ requires = ["uv_build >= 0.7.19, <0.9.0"]
 build-backend = "uv_build"
 
 [project.scripts]
-ethernot = "ethernot.ethernot:main"
+ethernot = "ethernot.ethernot:entry"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -58,13 +58,18 @@ def set_loading_anim(enable: bool):
 def print_help():
     print_formatted_text(FormattedText([
         ("fg:#FFC600", "[ethernot/help]\n"),
-        ("fg:#51DBBB", "[/quit /exit] > "),
+        ("fg:#51DBBB", "[/quit | /exit] > "),
         ("", "Why would you want to do that?\n"),
         ("fg:#51DBBB", "[/nick <user>] > "),
         ("", "Set your username.\n"),
         ("fg:#51DBBB", "[/color #6DGHEX] > "),
         ("", "Change what you look like on others' clients.\n"),
-        ("fg:#FF0000", "TELL QWIK HE FORGOT TO FINISH THE HELP\n"),
+        ("fg:#51DBBB", "[/list] > "),
+        ("", "Get a list of all joinable channels. You're in ethernot/general by default.\n"),
+        ("fg:#51DBBB", "[/join channel | /switch channel] > "),
+        ("", "Change to a channel. Use [/list] to see which exist\n"),
+        ("fg:#51DBBB", "[/create CHANNEL] > "),
+        ("", "Create a channel and switch to it. Careful - irreversable, except by closing all clients.\n"),
     ]))
 
 def list_users():
@@ -124,6 +129,7 @@ async def send_loop(writer, username, session):
         print_formatted_text(FormattedText([
             ("#FF4444", f"[!] issue sending: {e} (You should never see this! Report to @qwik)")
         ]))
+        shutdown_event.set()
     finally:
         print_formatted_text(FormattedText([
             ("fg:#888888", "[*] Exiting ethernot. goodbye :)")

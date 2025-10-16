@@ -4,16 +4,21 @@ import time
 import random
 import asyncio
 import json
+import signal
+import sys
 
-from prompt_toolkit import PromptSession
+from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.formatted_text import FormattedText
-from prompt_toolkit import print_formatted_text
 
 SERVER_PORT = 6780
 
 _animation_event = threading.Event()
 _animation_thread = None
+
+users = []
+
+shutdown_event = asyncio.Event()
 
 def loading_anim(): # do not call this from main thread
     symbols = [
@@ -50,33 +55,109 @@ def set_loading_anim(enable: bool):
         _animation_event.clear()
         print("\n")
 
+def print_help():
+    print_formatted_text(FormattedText([
+        ("fg:#FFC600", "[ethernot/help]\n"),
+        ("fg:#51DBBB", "[/quit /exit] > "),
+        ("", "Why would you want to do that?\n"),
+        ("fg:#51DBBB", "[/nick <user>] > "),
+        ("", "Set your username.\n"),
+        ("fg:#51DBBB", "[/color #6DGHEX] > "),
+        ("", "Change what you look like on others' clients.\n"),
+        ("fg:#FF0000", "TELL QWIK HE FORGOT TO FINISH THE HELP\n"),
+    ]))
+
+def list_users():
+    global users
+    # Replace this and implement color support
+    if not users:
+        userlist = FormattedText([("fg:#884444", "You're all alone...")])
+    else:
+        userlist = ", ".join(users)
+    print_formatted_text(FormattedText([
+        ("fg:#FFC600", "[ethernot/who]\n"),
+        ("fg:#51DBBB", f"Currently {len(users)} clients connected.\n"),
+        ("", f"Active: {userlist}"),
+    ]))
+    pass
+
 async def send_loop(writer, username, session):
-    while True:
-        prompt_text = FormattedText([("fg: #FFC600", f"[{username}]"), ("fg:#FFFFFF", " > ")])
-        line = await session.prompt_async(prompt_text)
-        line = line.strip()
-        if not line:
-            continue
-        
-        msg = { # expand this
-            "type": "chat",
-            "author": username,
-            "timestamp": time.time(),
-            "body": line
-        }
-        
-        writer.write((json.dumps(msg) + "\n").encode())
-        await writer.drain()
+    try:
+        while not shutdown_event.is_set():
+            prompt_text = FormattedText([("fg: #FFC600", f"[{username}]"), ("fg:#FFFFFF", " > ")])
+            try:
+                line = await session.prompt_async(prompt_text)
+            except KeyboardInterrupt:
+                shutdown_event.set()
+                break
+            if line is None:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+
+            if line == "/help":
+                print_help()
+                continue
+            elif line == "/who":
+                list_users()
+                continue
+            elif line in ["/quit", "/exit", "/leave", "/disconnect", "/e", "qa!"]:
+                shutdown_event.set()
+                break
+
+            msg = { # expand this
+                "type": "chat",
+                "author": username,
+                "timestamp": time.time(),
+                "body": line
+            }
+            try:
+                writer.write((json.dumps(msg) + "\n").encode())
+                await writer.drain()
+            except (ConnectionResetError, BrokenPipeError):
+                print_formatted_text(FormattedText([("fg:#FF4444", "[!] Connection lost.")]))
+    
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        print_formatted_text(FormattedText([
+            ("#FF4444", f"[!] issue sending: {e} (You should never see this! Report to @qwik)")
+        ]))
+    finally:
+        print_formatted_text(FormattedText([
+            ("fg:#888888", "[*] Exiting ethernot. goodbye :)")
+        ]))
         
 async def recieve_loop(reader):
-    while data := await reader.readline():
-        try:
-            msg = json.loads(data.decode())
-            author = msg.get("author", "?")
-            body = msg.get("body", "") # check here if this breaks the input
-            print_formatted_text(FormattedText([("fg: #9966FF", f"[{author}]"), ("fg: #FFFFFF", f" >> {body}")]))
-        except json.JSONDecodeError as e:
-            print_formatted_text(FormattedText(["fg: #FF4444", f"[!] malformed message: {e}"]))
+    try:
+        while not shutdown_event.is_set():
+            try:
+                data = await reader.readline()
+            except asyncio.CancelledError:
+                break
+
+            if not data:
+                shutdown_event.set()
+                break
+
+            try:
+                msg = json.loads(data.decode())
+                author = msg.get("author", "?")
+                body = msg.get("body", "") # check here if this breaks the input
+                print_formatted_text(FormattedText([
+                    ("fg: #9966FF", f"[{author}]"),
+                    ("fg: #FFFFFF", f" >> {body}")
+                ]))
+            except json.JSONDecodeError as e:
+                print_formatted_text(FormattedText(["fg: #FF4444", f"[!] malformed message: {e}"]))
+
+    except asyncio.CancelledError:
+        return
+
+def handle_sigint():
+    if not shutdown_event.is_set():
+        shutdown_event.set()
 
 async def main():
     parser = argparse.ArgumentParser(prog="ethernot", description="EtherNOT CLI Client")
@@ -88,16 +169,55 @@ async def main():
     server = args.server
     print("\x1b[38;2;79;141;255m[i] Connecting...")
     set_loading_anim(True)
-    reader, writer = await asyncio.open_connection(server, SERVER_PORT)
+
+    try:
+        reader, writer = await asyncio.open_connection(server, SERVER_PORT)
+    except (ConnectionRefusedError, ConnectionAbortedError, ConnectionError, ConnectionResetError):
+        set_loading_anim(False)
+        print(f"\x1b[38;2;255;80;80m[!] Connection to {server}:{SERVER_PORT} failed. Is the server online?")
+        sys.exit(0)
+    
     set_loading_anim(False)
     print(f"\x1b[38;2;79;141;255m[*] Connected to {server}:{SERVER_PORT} as {username}")
 
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_signal_handler(signal.SIGINT, handle_sigint)
+    except NotImplementedError:
+        print("\x1b[38;2;255;80;80m[!] something here is broken on windows, tell @qwik")
+        pass
+
     session = PromptSession()
+
     with patch_stdout():
-        await asyncio.gather(send_loop(writer, username, session), recieve_loop(reader))
+        send_task = asyncio.create_task(send_loop(writer, username, session))
+        recv_task = asyncio.create_task(recieve_loop(reader))
+
+        await shutdown_event.wait()
+
+        for t in (send_task, recv_task):
+            if not t.done():
+                t.cancel()
+        
+        await asyncio.gather(send_task, recv_task, return_exceptions=True)
+
+    try:
+        writer.close()
+        await writer.wait_closed()
+        sys.exit(0) #finally lmao
+    except Exception:
+        pass
 
 def entry():
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
+    finally:
+        try:
+            print("\x1b[0m", end="", flush=True)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     entry()

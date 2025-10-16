@@ -4,7 +4,7 @@ version = "0.1.6"
 description = "Simple, anyonymous chat app where messages are never saved to a disk. Ever."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["prompt_toolkit>=3.0.52"]
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
 

@@ -1,10 +1,14 @@
 import argparse
 import threading
-import sys
 import time
 import random
 import asyncio
 import json
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit import print_formatted_text
 
 SERVER_PORT = 6780
 
@@ -26,7 +30,6 @@ def loading_anim(): # do not call this from main thread
     random.shuffle(symbols)
     while(1):
         _animation_event.wait()
-        
         for i in symbols[1]:
             if not _animation_event.is_set():
                 break
@@ -47,10 +50,10 @@ def set_loading_anim(enable: bool):
         _animation_event.clear()
         print("\n")
 
-async def send_loop(writer, username):
-    loop = asyncio.get_event_loop()
+async def send_loop(writer, username, session):
     while True:
-        line = await loop.run_in_executor(None, sys.stdin.readline) # should be non-blocking
+        prompt_text = FormattedText([("fg: #FFC600", f"[{username}]"), ("fg:#FFFFFF", " > ")])
+        line = await session.prompt_async(prompt_text)
         line = line.strip()
         if not line:
             continue
@@ -61,6 +64,7 @@ async def send_loop(writer, username):
             "timestamp": time.time(),
             "body": line
         }
+        
         writer.write((json.dumps(msg) + "\n").encode())
         await writer.drain()
         
@@ -69,10 +73,10 @@ async def recieve_loop(reader):
         try:
             msg = json.loads(data.decode())
             author = msg.get("author", "?")
-            body = msg.get("body", "") 
-            print(f"\x1b[38;2;79;141;255m[{author}] \x1b[38;2;255;255;255m>> {body}")
+            body = msg.get("body", "") # check here if this breaks the input
+            print_formatted_text(FormattedText([("fg: #9966FF", f"[{author}]"), ("fg: #FFFFFF", f" >> {body}")]))
         except json.JSONDecodeError as e:
-            print(f"\x1b[38;2;255;80;80m[!] malformed message: {e}")
+            print_formatted_text(FormattedText(["fg: #FF4444", f"[!] malformed message: {e}"]))
 
 async def main():
     parser = argparse.ArgumentParser(prog="ethernot", description="EtherNOT CLI Client")
@@ -88,7 +92,9 @@ async def main():
     set_loading_anim(False)
     print(f"\x1b[38;2;79;141;255m[*] Connected to {server}:{SERVER_PORT} as {username}")
 
-    await asyncio.gather(send_loop(writer, username), recieve_loop(reader))
+    session = PromptSession()
+    with patch_stdout():
+        await asyncio.gather(send_loop(writer, username, session), recieve_loop(reader))
 
 def entry():
     asyncio.run(main())

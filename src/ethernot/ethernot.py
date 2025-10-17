@@ -7,20 +7,64 @@ import json
 import signal
 import sys
 import re
+import ssl
+import os
+import hashlib
+from pathlib import Path
 
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.formatted_text import FormattedText
 
 SERVER_PORT = 6780
+FINGERPRINT_FILE = os.path.join(Path.home(), ".ethernot_server_fingerprint")
 
 _animation_event = threading.Event()
 _animation_thread = None
 
 users = []
-
 shutdown_event = asyncio.Event()
 
+def compute_cert_fingerprint_from_sslobj(sslobj):
+    der = None
+    try:
+        der = sslobj.getpeercert(binary_form=True)
+    except Exception as e:
+        print(f"[!] Something happened {e}")
+        pass
+    if not der:
+        return None
+    h = hashlib.sha256(der).hexdigest()
+    return h
+
+def save_pinned_fingerprint(fp_hex):
+    try:
+        with open(FINGERPRINT_FILE, "w") as f:
+            f.write(fp_hex.strip().lower())
+    except Exception as e:
+        print_formatted_text(FormattedText([("fg: FF4444", f"[!] Failed to write fingerprint: {e}")]))
+
+def load_pinned_fingerprint():
+    try:
+        if os.path.exists(FINGERPRINT_FILE):
+            with open(FINGERPRINT_FILE, "r") as f:
+                return f.read().strip().lower()
+    except Exception as e:
+        print_formatted_text(FormattedText([("fg: FF4444", f"[!] Error whilst loading fingerprint: {e}")]))
+    return None
+
+def make_ssl_context_for_client():
+    # intentionally allow handshake without CA verification
+    # doing manual fingerprint pinning for this since anonynymasfsdgjity is important
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    except Exception:
+        pass
+    return ctx
+    
 def loading_anim(): # do not call this from main thread
     symbols = [
         ["◴", "◷", "◶", "◵"],
@@ -46,7 +90,6 @@ def loading_anim(): # do not call this from main thread
 
 def set_loading_anim(enable: bool):
     global _animation_thread
-    
     if enable:
         if _animation_thread is None or not _animation_thread.is_alive():
             _animation_thread = threading.Thread(target = loading_anim, daemon = True)
@@ -136,6 +179,8 @@ async def send_loop(writer, username, session):
                 await writer.drain()
             except (ConnectionResetError, BrokenPipeError):
                 print_formatted_text(FormattedText([("fg:#FF4444", "[!] Connection lost.")]))
+                shutdown_event.set()
+                break
     
     except asyncio.CancelledError:
         return
@@ -190,16 +235,47 @@ async def main():
     server = args.server
     print("\x1b[38;2;79;141;255m[i] Connecting...")
     set_loading_anim(True)
-
-    try:
-        reader, writer = await asyncio.open_connection(server, SERVER_PORT)
-    except (ConnectionRefusedError, ConnectionAbortedError, ConnectionError, ConnectionResetError):
-        set_loading_anim(False)
-        print(f"\x1b[38;2;255;80;80m[!] Connection to {server}:{SERVER_PORT} failed. Is the server online?")
-        sys.exit(0)
     
+    ssl_ctx = make_ssl_context_for_client()
+    try:
+        reader, writer = await asyncio.open_connection(server, SERVER_PORT, ssl=ssl_ctx)
+    except Exception as e:
+        set_loading_anim(False)
+        print(f"\x1b[38;2;255;80;80m[!] Connection to {server}:{SERVER_PORT} failed: {e}")
+        return
+    
+    try: #handshake worked, get the fingerprint (MITM risk here but should be ok)
+        transport = writer.transport
+        sslobj = transport.get_extra_info('ssl_object')
+        fp = compute_cert_fingerprint_from_sslobj(sslobj)
+        if not fp:
+            raise RuntimeError("Couldn't read cert fingerprint!")
+    except Exception as e:
+        set_loading_anim(False)
+        print(f"\x1b[38;2;255;80;80m[!] Failed to get server cert: {e}")
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return
+            
+    pinned = load_pinned_fingerprint()
+    if pinned is None:
+        save_pinned_fingerprint(fp)
+        print(f"\x1b[38;2;79;141;255m[*] Pinned cert fingerprint: {fp}")
+    elif pinned != fp:
+        set_loading_anim(False)
+        print(f"\x1b[38;2;255;80;80m[!] Server fingerprint ({fp}) does not match pinned fingerprint ({pinned})!! Aborting.")
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return
+                
     set_loading_anim(False)
-    print(f"\x1b[38;2;79;141;255m[*] Connected to {server}:{SERVER_PORT} as {username}")
+    print(f"\x1b[38;2;79;141;255m[*] Connected securely to {server}:{SERVER_PORT} as {username}")
 
     loop = asyncio.get_running_loop()
     try:
@@ -209,17 +285,13 @@ async def main():
         pass
 
     session = PromptSession()
-
     with patch_stdout():
         send_task = asyncio.create_task(send_loop(writer, username, session))
         recv_task = asyncio.create_task(recieve_loop(reader))
-
         await shutdown_event.wait()
-
         for t in (send_task, recv_task):
             if not t.done():
                 t.cancel()
-        
         await asyncio.gather(send_task, recv_task, return_exceptions=True)
 
     try:

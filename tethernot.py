@@ -4,6 +4,8 @@ import os
 import datetime
 import sys
 import ipaddress
+import argparse
+import shutil
 
 from cryptography import x509
 from cryptography.x509.oid import NameOID
@@ -104,6 +106,14 @@ async def handle_client(reader, writer):
             pass
             
 async def main():
+    parser = argparse.ArgumentParser(prog = "tethernot", description = "Server for EtherNOT")
+    parser.add_argument("--regencerts", help="Regenerate certificates to connect clients anew.", action = "store_true")
+    args = parser.parse_args()
+    
+    if args.regencerts:
+        shutil.rmtree(CERT_DIR)
+        print("\x1b[38;2;79;141;255m[*] Regenerating certificates!")
+    
     ensure_certificates()
     
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -116,7 +126,7 @@ async def main():
     
     try:
         fp = cert_fp_hex(SERVER_CERT_FILE)
-        print(f"\x1b[38;2;79;141;255m[*] Server cert SHA256 fingerprint: \n{fp}")
+        print(f"\x1b[38;2;79;141;255m[*] Server cert SHA256 fingerprint:\n    {fp}")
     except Exception as e:
         print(f"[i] Something happened: {e}")
         pass

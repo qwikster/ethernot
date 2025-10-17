@@ -6,6 +6,7 @@ import asyncio
 import json
 import signal
 import sys
+import re
 
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -87,14 +88,16 @@ def list_users():
     pass
 
 async def send_loop(writer, username, session):
+    color = "#9966FF"
     try:
         while not shutdown_event.is_set():
-            prompt_text = FormattedText([("fg: #FFC600", f"[{username}]"), ("fg:#FFFFFF", " > ")])
+            prompt_text = FormattedText([(f"fg: {color}", f"[{username}]"), ("", " >> ")])
             try:
                 line = await session.prompt_async(prompt_text)
             except KeyboardInterrupt:
                 shutdown_event.set()
                 break
+            
             if line is None:
                 continue
             line = line.strip()
@@ -110,10 +113,21 @@ async def send_loop(writer, username, session):
             elif line in ["/quit", "/exit", "/leave", "/disconnect", "/e", "qa!"]:
                 shutdown_event.set()
                 break
+            elif line.startswith("name"):
+                username = input("Pick a username >... ")
+                continue
+            elif line.startswith("/color"):
+                ans = line.strip("/color ")
+                if not re.match(r"^#(?:[0-9a-fA-F]{3}){1,2}$", ans):
+                    print_formatted_text(FormattedText([("fg:#FF4444", "[!] Not a valid color")]))
+                else:
+                    color = ans
+                continue
 
             msg = { # expand this
-                "type": "chat",
+                "type": "message",
                 "author": username,
+                "color": color,
                 "timestamp": time.time(),
                 "body": line
             }
@@ -150,10 +164,11 @@ async def recieve_loop(reader):
             try:
                 msg = json.loads(data.decode())
                 author = msg.get("author", "?")
+                color = msg.get("color", "#9966FF")
                 body = msg.get("body", "") # check here if this breaks the input
                 print_formatted_text(FormattedText([
-                    ("fg: #9966FF", f"[{author}]"),
-                    ("fg: #FFFFFF", f" >> {body}")
+                    (f"fg: {color}", f"[{author}]"),
+                    ("", f" >> {body}")
                 ]))
             except json.JSONDecodeError as e:
                 print_formatted_text(FormattedText(["fg: #FF4444", f"[!] malformed message: {e}"]))

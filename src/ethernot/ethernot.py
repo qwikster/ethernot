@@ -177,6 +177,8 @@ async def send_loop(writer, username, session):
                 shutdown_event.set()
                 break
             elif line.startswith("/name") or line.startswith("/nick"):
+                if len(line) <= 6:
+                    continue
                 parts = line.split(maxsplit = 1)
                 if len(parts) == 2 and validate_regex(parts[1].strip(), USERNAME_RE):
                     username = parts[1].strip()
@@ -189,6 +191,8 @@ async def send_loop(writer, username, session):
                     ]))
                 continue
             elif line.startswith("/color"):
+                if len(line) <= 7:
+                    continue
                 parts = line.split(maxsplit=1)
                 if len(parts) == 2 and validate_regex(parts[1].strip(), COLOR_RE):
                     color = parts[1].strip()

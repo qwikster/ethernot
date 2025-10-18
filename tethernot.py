@@ -8,6 +8,7 @@ import argparse
 import shutil
 from collections import defaultdict
 import re
+import time
 
 from cryptography import x509
 from cryptography.x509.oid import NameOID
@@ -21,9 +22,10 @@ SERVER_KEY_FILE = os.path.join(CERT_DIR, "server_key.pem")
 
 clients = set()
 PORT = 6780
+blocklist = []
 
 MAX_MESSAGE_BYTES = 8192
-MAX_BODY_CHARS = 4096
+MAX_BODY_CHARS = 512
 RATE_LIMIT_TOKENS = 5
 RATE_LIMIT_REFILL = 1.0
 
@@ -102,13 +104,22 @@ def little_bobby_tables(s, maxlen=MAX_BODY_CHARS):
     return s
         
 async def handle_client(reader, writer):
+    global blocklist
     clients.add(writer)
     broken_clients = []
     addr = writer.get_extra_info('peername')
     print(f"\x1b[38;2;127;255;212m[+] client {addr} connected")
+    last_block = time.time()
     
     try:
         while True:
+            
+            if addr[0] in blocklist:
+                return #user got blocked 
+            
+            if time.time() - last_block >= 30:
+                blocklist = []
+            
             try:
                 data = await reader.readline()
             except asyncio.IncompleteReadError:
@@ -127,6 +138,7 @@ async def handle_client(reader, writer):
             bucket = buckets[writer]
             if not bucket.consume():
                 print(f"\x1b[38;2;255;80;80m[!] Client {addr} exceeded rate limit, disconnecting")
+                blocklist.append(addr[0])
                 break
             
             # broadcast to ALL clients here

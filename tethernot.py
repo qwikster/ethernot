@@ -82,7 +82,7 @@ async def handle_client(reader, writer):
                         client.write(data)
                         await client.drain()
                 except Exception:
-                    broken_clients.appent(client)
+                    broken_clients.append(client)
             
             for c in broken_clients:
                 try:

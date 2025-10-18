@@ -6,6 +6,8 @@ import sys
 import ipaddress
 import argparse
 import shutil
+from collections import defaultdict
+import re
 
 from cryptography import x509
 from cryptography.x509.oid import NameOID
@@ -19,6 +21,30 @@ SERVER_KEY_FILE = os.path.join(CERT_DIR, "server_key.pem")
 
 clients = set()
 PORT = 6780
+
+MAX_MESSAGE_BYTES = 8192
+MAX_BODY_CHARS = 4096
+RATE_LIMIT_TOKENS = 5
+RATE_LIMIT_REFILL = 1.0
+
+class TokenBucket:
+    __slots__ = ("tokens", "last_ts")
+    
+    def __init__(self, capacity: float, refill_per_sec: float):
+        self.tokens = capacity
+        self.last_ts = asyncio.get_event_loop().time()
+    
+    def consume(self, amount: float = 1.0) -> bool:
+        now = asyncio.get_event_loop().time()
+        elapsed = max(0.0, now - self.last_ts)
+        self.tokens = min(RATE_LIMIT_TOKENS, self.tokens + elapsed * RATE_LIMIT_REFILL)
+        self.last_ts = now
+        if self.tokens >= amount:
+            self.tokens -= amount
+            return True
+        return False
+
+buckets = defaultdict(lambda: TokenBucket(RATE_LIMIT_TOKENS, RATE_LIMIT_REFILL))
 
 def ensure_certificates():
     os.makedirs(CERT_DIR, exist_ok = True)
@@ -40,7 +66,7 @@ def ensure_certificates():
             .not_valid_after(datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=3650/2))
             .add_extension(x509.SubjectAlternativeName([
                 x509.DNSName(u"localhost"),
-                x509.IPAddress(ipaddress.IPv4Address("0.0.0.0")),
+                x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
                 ]), critical=False
                 )
             .sign(key, hashes.SHA256())
@@ -57,12 +83,23 @@ def ensure_certificates():
             f.write(cert.public_bytes(serialization.Encoding.PEM))
             
 def cert_fp_hex(pem_path):
-    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives import hashes as _hashes
     from cryptography.x509 import load_pem_x509_certificate
     with open(pem_path, "rb") as f:
         cert = load_pem_x509_certificate(f.read())
-    digest = cert.fingerprint(hashes.SHA256())
+    digest = cert.fingerprint(_hashes.SHA256())
     return digest.hex()
+
+def little_bobby_tables(s, maxlen=MAX_BODY_CHARS):
+    if not isinstance(s, str):
+        try:
+            s = str(s)
+        except Exception:
+            return ""
+    s = re.sub(r'[\x00-\x1f\x7f]+', ' ', s)
+    if len(s) > maxlen:
+        s = s[:maxlen]
+    return s
         
 async def handle_client(reader, writer):
     clients.add(writer)
@@ -72,9 +109,26 @@ async def handle_client(reader, writer):
     
     try:
         while True:
-            data = await reader.readline()
+            try:
+                data = await reader.readline()
+            except asyncio.IncompleteReadError:
+                break
+            except Exception as e:
+                print(f"\x1b[38;2;255;80;80m[!] error: {e}")
+                break
+            
             if not data:
                 break
+            
+            if len(data) > MAX_MESSAGE_BYTES:
+                print(f"\x1b[38;2;255;80;80m[!] Client {addr} send oversized message of {len(data)} bytes, disconnecting")
+                break
+            
+            bucket = buckets[writer]
+            if not bucket.consume():
+                print(f"\x1b[38;2;255;80;80m[!] Client {addr} exceeded rate limit, disconnecting")
+                break
+            
             # broadcast to ALL clients here
             for client in list(clients):
                 try:

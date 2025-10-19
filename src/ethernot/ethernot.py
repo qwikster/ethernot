@@ -33,12 +33,14 @@ channel = "general"
 channel_list = ["general"]
 
 def compute_cert_fingerprint_from_sslobj(sslobj):
+    if sslobj is None:
+        return None
     der = None
     try:
         der = sslobj.getpeercert(binary_form=True)
     except Exception as e:
         print(f"[!] Something happened: {e}")
-        pass
+        return None
     if not der:
         return None
     h = hashlib.sha256(der).hexdigest()
@@ -84,8 +86,10 @@ def little_bobby_tables(s: str, maxlen: int = MAX_BODY_CHARS) -> str:
         s = s[:maxlen]
     return s
 
-def validate_regex(input: str, regex) -> bool:
-    return bool(regex.match(input))
+def validate_regex(inp: str, regex) -> bool:
+    if not isinstance(inp, str):
+        return False
+    return bool(regex.match(inp))
     
 def loading_anim(): # do not call this from main thread
     symbols = [
@@ -119,7 +123,8 @@ def set_loading_anim(enable: bool):
         _animation_event.set()
     else:
         _animation_event.clear()
-        print("\n")
+        print("\r", end="", flush=True)
+        print()
 
 def print_help():
     print_formatted_text(FormattedText([
@@ -141,18 +146,16 @@ def print_help():
     ]))
 
 def list_users():
-    global users
-    # Replace this and implement color support
     if not users:
-        userlist = FormattedText([("fg:#884444", "You're all alone...")])
+        userlist_text = FormattedText([("fg:#884444", "You're all alone...")])
     else:
-        userlist = ", ".join(users)
+        joined = ", ".join(users)
+        userlist_text = FormattedText([("", joined)])
     print_formatted_text(FormattedText([
         ("fg:#FFC600", "[ethernot/who]\n"),
         ("fg:#51DBBB", f"Currently {len(users)} clients connected. Active:"),
     ]))
-    print_formatted_text(userlist)
-    pass
+    print_formatted_text(userlist_text)
 
 async def send_msg(writer, msg):
     try:
@@ -204,7 +207,7 @@ async def send_loop(writer, username, session):
             prompt_text = FormattedText([(f"fg:{color}", f"[{username}]"), ("", " >> ")])
             try:
                 line = await session.prompt_async(prompt_text)
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, EOFError, asyncio.CancelledError):
                 shutdown_event.set()
                 break
             
@@ -217,31 +220,40 @@ async def send_loop(writer, username, session):
             if line == "/help":
                 print_help()
                 continue
+            
             elif line == "/who":
                 list_users()
                 continue
+            
             elif line in ["/quit", "/exit", "/leave", "/disconnect", "/e", "qa!"]:
                 shutdown_event.set()
                 break
+            
             elif line.startswith("/name") or line.startswith("/nick"):
-                if len(line) <= 6:
+                parts = line.split(maxsplit=1)
+                if len(parts) != 2:
+                    print_formatted_text(FormattedText([("fg:#FF4444", "[!] Usage: /nick <username>")]))
                     continue
-                parts = line.split(maxsplit = 1)
-                if len(parts) == 2 and validate_regex(parts[1].strip(), USERNAME_RE):
-                    username = parts[1].strip()
+                new_name = parts[1].strip()
+                if validate_regex(new_name, USERNAME_RE):
+                    username = new_name
+                    if username not in users:
+                        users.append(username)
                     print_formatted_text(FormattedText([
                        (f"fg:{color}", f"[✓] Username set to {username}") 
                     ]))
                 else:
                     print_formatted_text(FormattedText([
-                        ("fg:#FF4444", f"[!] Invalid username: {parts[1].strip()}. Max 32 chars, alphanumeric plus _.-")
+                        ("fg:#FF4444", f"[!] Invalid username: {new_name}. Max 32 chars, alphanumeric plus _.-")
                     ]))
                 continue
+            
             elif line.startswith("/color"):
-                if len(line) <= 7:
-                    continue
                 parts = line.split(maxsplit=1)
-                if len(parts) == 2 and validate_regex(parts[1].strip(), COLOR_RE):
+                if len(parts) != 2:
+                    print_formatted_text(FormattedText([("fg:#FF4444", "[!] Usage: /color #RRGGBB")]))
+                    continue
+                if validate_regex(parts[1].strip(), COLOR_RE):
                     color = parts[1].strip()
                     print_formatted_text(FormattedText([
                        (f"fg:{color}", f"[✓] Color set to {color}") 
@@ -251,11 +263,13 @@ async def send_loop(writer, username, session):
                         ("fg:#FF4444", f"[!] Invalid hex color: {parts[1].strip()}.")
                     ]))
                 continue
+            
             elif line.startswith("/create"):
-                if len(line) <= 8:
-                    continue
                 parts = line.split(maxsplit=1)
-                if len(parts) == 2 and validate_regex(parts[1].strip(), USERNAME_RE):
+                if len(parts) != 2:
+                    print_formatted_text(FormattedText([("fg:#FF4444", "[!] Usage: /create <channel>")]))
+                    continue
+                if validate_regex(parts[1].strip(), USERNAME_RE):
                     channel = parts[1].strip()
                     channel_list.append(channel)
                     msg = {
@@ -266,22 +280,31 @@ async def send_loop(writer, username, session):
                     status = await send_msg(writer, msg)
                     if not status:
                         break
+                    print_formatted_text(FormattedText([
+                        ("fg:#51DBBB", f"[i] Created channel ethernot/{parts[1].strip()}."),
+                    ]))
                     continue
                 else:
                     print_formatted_text(FormattedText([
                         ("fg:#FF4444", f"[!] Invalid channel name: {parts[1].strip()}.")
                     ]))
+                    
             elif line == "/list":
                 channellist = "], [ethernot/".join(channel_list)
                 the = ("[ethernot/" + channellist + "]")
                 print(the)
                 continue
+            
             elif line.startswith("/join") or line.startswith("/switch"):
-                if len(line) <= 8:
-                    continue
                 parts = line.split(maxsplit=1)
+                if len(parts) != 2:
+                    print_formatted_text(FormattedText([("fg:#FF4444", "[!] Usage: /join <channel>")]))
+                    continue
                 if parts[1].strip() in channel_list:
                     channel = parts[1].strip()
+                    print_formatted_text(FormattedText([
+                        ("fg:#51DBBB", f"[i] Moved to ethernot/{parts[1].strip()}"),
+                    ]))
                 else:
                     print_formatted_text(FormattedText([
                         ("fg:#FF4444", f"[!] Channel doesn't appear to exist: {parts[1].strip()}.")
@@ -312,12 +335,15 @@ async def send_loop(writer, username, session):
         ]))
         shutdown_event.set()
     finally:
-        msg = {
-            "type": "leave",
-            "author": username
-        }
-        await send_msg(writer, msg)
-        print_formatted_text(FormattedText([
+        try:
+            msg = {
+                "type": "leave",
+                "author": username
+            }
+            await send_msg(writer, msg)
+        except Exception:
+            pass
+        print_formatted_text(FormattedText([    
             ("fg:#888888", "[*] Exiting ethernot. goodbye :)")
         ]))
         
@@ -363,16 +389,21 @@ async def recieve_loop(reader):
                             (f"fg:{color}", f"[{author}]"),
                             ("", f" >> {body}")
                         ]))
+                        
                 elif msgtype == "newchannel":
-                    channel_list.append(msg.get("name"))
+                    name = msg.get("name")
+                    if name not in channel_list:
+                        channel_list.append(name)
                     print_formatted_text(FormattedText([
                         ("fg:#51DBBB", f"[i] {msg.get("author", "?")} created the channel ethernot/{msg.get("name", "?")}!"),
                     ]))
+                    
                 elif msgtype == "join":
                     users.append(msg.get("author", "?"))
                     print_formatted_text(FormattedText([
                         ("fg:#51DBBB", f"[+] {msg.get("author", "?")} connected"),
                     ]))
+                    
                 elif msgtype == "leave":
                     author = msg.get("author") or "?"
                     try:
@@ -407,16 +438,21 @@ async def main():
     
     if args.renew:
         try:
-            os.remove(FINGERPRINT_FILE)
-            print("\x1b[38;2;79;141;255m[*] Regenerating certificates!")
+            if os.path.exists(FINGERPRINT_FILE):
+                os.remove(FINGERPRINT_FILE)
+                print("\x1b[38;2;79;141;255m[*] Regenerating certificates!")
         except Exception:
             pass
     
-    username = args.user
-    users.append(username)
+    username = args.user.strip()
     if not validate_regex(username, USERNAME_RE):
         print("\x1b[38;2;255;80;80m[!] Invalid username: 1-32 chars: alphanumeric plus _.-")
-    server = args.server
+        return
+    
+    if username not in users:
+        users.append(username)
+        
+    server = args.server.strip()
     
     print("\x1b[38;2;79;141;255m[i] Connecting...")
     set_loading_anim(True)

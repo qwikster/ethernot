@@ -29,6 +29,8 @@ _animation_thread = None
 
 users = []
 shutdown_event = asyncio.Event()
+channel = "general"
+channel_list = ["general"]
 
 def compute_cert_fingerprint_from_sslobj(sslobj):
     der = None
@@ -134,6 +136,8 @@ def print_help():
         ("", "Change to a channel. Use [/list] to see which exist\n"),
         ("fg:#51DBBB", "[/create CHANNEL] > "),
         ("", "Create a channel and switch to it. Careful - irreversable, except by closing all clients.\n"),
+        ("fg:#51DBBB", "[/who] > "),
+        ("", "List currently online users\n"),
     ]))
 
 def list_users():
@@ -150,11 +154,54 @@ def list_users():
     print_formatted_text(userlist)
     pass
 
+async def send_msg(writer, msg):
+    try:
+        encoded = (json.dumps(msg) + "\n").encode()
+    except Exception as e:
+        print_formatted_text(FormattedText([
+            ("fg:#FF4444", f"[!] JSON encode error: {e}")
+        ]))
+        return False
+    
+    if len(encoded) > MAX_MESSAGE_BYTES:
+        print_formatted_text(FormattedText([
+            ("fg:#FF4444", f"[!] Length of parcel ({len(encoded)} chars) is above the message limit of 4096")
+        ]))
+        return False
+    
+    try:
+        writer.write(encoded)
+        await writer.drain()
+    except (ConnectionResetError, BrokenPipeError):
+        print_formatted_text(FormattedText([("fg:#FF4444", "[!] Connection lost.")]))
+        shutdown_event.set()
+        return False
+    except Exception as e:
+        print_formatted_text(FormattedText([("fg:#FF4444", f"[!] Unexpected error while sending: {e}")]))
+        shutdown_event.set()
+        return False
+    return True
+
 async def send_loop(writer, username, session):
     color = "#9966FF"
+    global channel
+    global channel_list
+    first_time = True
     try:
         while not shutdown_event.is_set():
-            prompt_text = FormattedText([(f"fg: {color}", f"[{username}]"), ("", " >> ")])
+            if first_time:
+                first_time = False
+                msg = {
+                    "type": "join",
+                    "author": username
+                }
+                status = await send_msg(writer, msg)
+                if not status:
+                    break
+                else:
+                    continue
+            
+            prompt_text = FormattedText([(f"fg:{color}", f"[{username}]"), ("", " >> ")])
             try:
                 line = await session.prompt_async(prompt_text)
             except KeyboardInterrupt:
@@ -204,40 +251,58 @@ async def send_loop(writer, username, session):
                         ("fg:#FF4444", f"[!] Invalid hex color: {parts[1].strip()}.")
                     ]))
                 continue
+            elif line.startswith("/create"):
+                if len(line) <= 8:
+                    continue
+                parts = line.split(maxsplit=1)
+                if len(parts) == 2 and validate_regex(parts[1].strip(), USERNAME_RE):
+                    channel = parts[1].strip()
+                    channel_list.append(channel)
+                    msg = {
+                        "type": "newchannel",
+                        "name": channel,
+                        "author": username,
+                    }
+                    status = await send_msg(writer, msg)
+                    if not status:
+                        break
+                    continue
+                else:
+                    print_formatted_text(FormattedText([
+                        ("fg:#FF4444", f"[!] Invalid channel name: {parts[1].strip()}.")
+                    ]))
+            elif line == "/list":
+                channellist = "], [ethernot/".join(channel_list)
+                the = ("[ethernot/" + channellist + "]")
+                print(the)
+                continue
+            elif line.startswith("/join") or line.startswith("/switch"):
+                if len(line) <= 8:
+                    continue
+                parts = line.split(maxsplit=1)
+                if parts[1].strip() in channel_list:
+                    channel = parts[1].strip()
+                else:
+                    print_formatted_text(FormattedText([
+                        ("fg:#FF4444", f"[!] Channel doesn't appear to exist: {parts[1].strip()}.")
+                    ]))
+                continue
             
             body = little_bobby_tables(line)
             msg = { # expand this
                 "type": "message",
+                "channel": channel,
                 "author": username,
                 "color": color,
                 "timestamp": time.time(),
                 "body": body
             }
-            try:
-                encoded = (json.dumps(msg) + "\n").encode()
-            except Exception as e:
-                print_formatted_text(FormattedText([
-                    ("fg:#FF4444", f"[!] JSON encode error: {e}")
-                ]))
-                continue
             
-            if len(encoded) > MAX_MESSAGE_BYTES:
-                print_formatted_text(FormattedText([
-                    ("fg:#FF4444", f"[!] Length of parcel ({len(encoded)} chars) is above the message limit of 4096")
-                ]))
+            status = await send_msg(writer, msg)
+            if not status:
+                break
+            elif status:
                 continue
-            
-            try:
-                writer.write(encoded)
-                await writer.drain()
-            except (ConnectionResetError, BrokenPipeError):
-                print_formatted_text(FormattedText([("fg:#FF4444", "[!] Connection lost.")]))
-                shutdown_event.set()
-                break
-            except Exception as e:
-                print_formatted_text(FormattedText([("fg:#FF4444", f"[!] Unexpected error while sending: {e}")]))
-                shutdown_event.set()
-                break
                 
     except asyncio.CancelledError:
         return
@@ -247,11 +312,18 @@ async def send_loop(writer, username, session):
         ]))
         shutdown_event.set()
     finally:
+        msg = {
+            "type": "leave",
+            "author": username
+        }
+        await send_msg(writer, msg)
         print_formatted_text(FormattedText([
             ("fg:#888888", "[*] Exiting ethernot. goodbye :)")
         ]))
         
 async def recieve_loop(reader):
+    global channel
+    global channel_list
     try:
         while not shutdown_event.is_set():
             try:
@@ -276,19 +348,48 @@ async def recieve_loop(reader):
                 msg = json.loads(data.decode(errors="replace"))
                 if not isinstance(msg, dict):
                     raise ValueError("Message is not an object! (Corrupted or still encrypted?)")
-                author = little_bobby_tables(msg.get("author", "?"), maxlen = 32)
-                color = msg.get("color", "#9966FF")
-                if not validate_regex(color, COLOR_RE):
-                    color = "#9966FF"
-                body = little_bobby_tables(msg.get("body", "")) # check here if this breaks the input
-                print_formatted_text(FormattedText([
-                    (f"fg: {color}", f"[{author}]"),
-                    ("", f" >> {body}")
-                ]))
+                msgtype = msg.get("type", "?")
+                
+                if msgtype == "message":
+                    if msg.get("channel", "?") == channel:
+                        author = little_bobby_tables(msg.get("author", "?"), maxlen = 32)
+                        if author not in users:
+                            users.append(author)
+                        color = msg.get("color", "#9966FF")
+                        if not validate_regex(color, COLOR_RE):
+                            color = "#9966FF"
+                        body = little_bobby_tables(msg.get("body", "")) # check here if this breaks the input
+                        print_formatted_text(FormattedText([
+                            (f"fg:{color}", f"[{author}]"),
+                            ("", f" >> {body}")
+                        ]))
+                elif msgtype == "newchannel":
+                    channel_list.append(msg.get("name"))
+                    print_formatted_text(FormattedText([
+                        ("fg:#51DBBB", f"[i] {msg.get("author", "?")} created the channel ethernot/{msg.get("name", "?")}!"),
+                    ]))
+                elif msgtype == "join":
+                    users.append(msg.get("author", "?"))
+                    print_formatted_text(FormattedText([
+                        ("fg:#51DBBB", f"[+] {msg.get("author", "?")} connected"),
+                    ]))
+                elif msgtype == "leave":
+                    author = msg.get("author") or "?"
+                    try:
+                        if author in users:
+                            users.remove(author)
+                    except ValueError:
+                        pass  # already gone
+
+                    print_formatted_text(FormattedText([
+                        ("fg:#ffc14f", f"[-] {author} left")
+                    ]))
+
+                    
             except json.JSONDecodeError as e:
-                print_formatted_text(FormattedText(["fg: #FF4444", f"[!] malformed message: {e}"]))
+                print_formatted_text(FormattedText(["fg:#FF4444", f"[!] malformed message: {e}"]))
             except Exception as e:
-                print_formatted_text(FormattedText(["fg: #FF4444", f"[!] error processing message: {e}"]))
+                print_formatted_text(FormattedText(["fg:#FF4444", f"[!] error processing message: {e}"]))
 
     except asyncio.CancelledError:
         return
@@ -312,6 +413,7 @@ async def main():
             pass
     
     username = args.user
+    users.append(username)
     if not validate_regex(username, USERNAME_RE):
         print("\x1b[38;2;255;80;80m[!] Invalid username: 1-32 chars: alphanumeric plus _.-")
     server = args.server

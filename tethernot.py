@@ -25,7 +25,7 @@ PORT = 6780
 blocklist = []
 
 MAX_MESSAGE_BYTES = 8192
-MAX_BODY_CHARS = 512
+MAX_BODY_CHARS = 4096
 RATE_LIMIT_TOKENS = 5
 RATE_LIMIT_REFILL = 1.0
 
@@ -113,12 +113,11 @@ async def handle_client(reader, writer):
     
     try:
         while True:
+            if time.time() - last_block >= 30:
+                blocklist = []
             
             if addr[0] in blocklist:
                 return #user got blocked 
-            
-            if time.time() - last_block >= 30:
-                blocklist = []
             
             try:
                 data = await reader.readline()

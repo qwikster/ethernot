@@ -6,31 +6,29 @@ import sys
 import ipaddress
 import argparse
 import shutil
-from collections import defaultdict
-import re
 import time
+from collections import defaultdict
 
-from cryptography import x509
+from cryptography import x509 # i hate myself
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-CERT_DIR = ".certs"
-CA_CERT_FILE = os.path.join(CERT_DIR, "ca_cert.pem") # should (?) never be needed by client
+CERT_DIR = ".certs" # needs revison, permissions? should be fine. *check on windows, fuck microsoft
 SERVER_CERT_FILE = os.path.join(CERT_DIR, "server_cert.pem")
 SERVER_KEY_FILE = os.path.join(CERT_DIR, "server_key.pem")
 
 clients = set()
+blocklist = {}
 PORT = 6780
-blocklist = []
 
-MAX_MESSAGE_BYTES = 8192
-MAX_BODY_CHARS = 4096
-RATE_LIMIT_TOKENS = 5
-RATE_LIMIT_REFILL = 1.0
+BLOCK_DURATION = 30 # tweak time if it's annoying. client side message? don't think i can b/c no decrypt server side
+token_num = 5
+token_regen = 1.0
+buckets = defaultdict(lambda: TokenBucket(token_num, token_regen))
 
 class TokenBucket:
-    __slots__ = ("tokens", "last_ts")
+    __slots__ = ("tokens", "last_ts") # slots?? DID SOMEBODY SAY GAMBLING??
     
     def __init__(self, capacity: float, refill_per_sec: float):
         self.tokens = capacity
@@ -39,14 +37,12 @@ class TokenBucket:
     def consume(self, amount: float = 1.0) -> bool:
         now = asyncio.get_event_loop().time()
         elapsed = max(0.0, now - self.last_ts)
-        self.tokens = min(RATE_LIMIT_TOKENS, self.tokens + elapsed * RATE_LIMIT_REFILL)
+        self.tokens = min(token_num, self.tokens + elapsed * token_regen) # also change these if it's annoying
         self.last_ts = now
         if self.tokens >= amount:
             self.tokens -= amount
             return True
         return False
-
-buckets = defaultdict(lambda: TokenBucket(RATE_LIMIT_TOKENS, RATE_LIMIT_REFILL))
 
 def ensure_certificates():
     os.makedirs(CERT_DIR, exist_ok = True)
@@ -91,54 +87,31 @@ def cert_fp_hex(pem_path):
         cert = load_pem_x509_certificate(f.read())
     digest = cert.fingerprint(_hashes.SHA256())
     return digest.hex()
-
-def little_bobby_tables(s, maxlen=MAX_BODY_CHARS):
-    if not isinstance(s, str):
-        try:
-            s = str(s)
-        except Exception:
-            return ""
-    s = re.sub(r'[\x00-\x1f\x7f]+', ' ', s)
-    if len(s) > maxlen:
-        s = s[:maxlen]
-    return s
         
 async def handle_client(reader, writer):
-    global blocklist
+    ip = writer.get_extra_info('peername') # tuple("ip", "port")
+    addr = ip[0] # string, more useful
+    now = time.time()
+    if addr in blocklist and now < blocklist[addr]:
+                print(f"\x1b[38;2;255;80;80m[!] User \x1b[38;2;79;141;255m{addr}\x1b[38;2;255;80;80m is blocked!")
+                return
     clients.add(writer)
-    broken_clients = []
-    addr = writer.get_extra_info('peername')
-    print(f"\x1b[38;2;127;255;212m[+] client {addr} connected")
-    last_block = time.time()
+    print(f"\x1b[38;2;127;255;212m[+] client \x1b[38;2;79;141;255m{addr} \x1b[38;2;127;255;212mconnected")
     
     try:
         while True:
-            if time.time() - last_block >= 30:
-                blocklist = []
-            
-            if addr[0] in blocklist:
-                return #user got blocked 
-            
-            try:
-                data = await reader.readline()
-            except asyncio.IncompleteReadError:
-                break
-            except Exception as e:
-                print(f"\x1b[38;2;255;80;80m[!] error: {e}")
-                break
-            
+            data = await reader.readline()
             if not data:
                 break
-            
-            if len(data) > MAX_MESSAGE_BYTES:
-                print(f"\x1b[38;2;255;80;80m[!] Client {addr} send oversized message of {len(data)} bytes, disconnecting")
-                break
-            
-            bucket = buckets[writer]
+
+            bucket = buckets[addr]
+
             if not bucket.consume():
-                print(f"\x1b[38;2;255;80;80m[!] Client {addr} exceeded rate limit, disconnecting")
-                blocklist.append(addr[0])
+                print(f"\x1b[38;2;255;80;80m[!] Client \x1b[38;2;79;141;255m{addr}\x1b[38;2;255;80;80m exceeded rate limit, disconnecting")
+                blocklist[addr] = now + BLOCK_DURATION
                 break
+
+            broken = []
             
             # broadcast to ALL clients here
             for client in list(clients):
@@ -147,11 +120,12 @@ async def handle_client(reader, writer):
                         client.write(data)
                         await client.drain()
                 except Exception:
-                    broken_clients.append(client)
+                    broken.append(client)
             
-            for c in broken_clients:
+            for c in broken:
                 try:
                     clients.remove(c)
+                    broken.remove(c)
                     c.close()
                 except Exception:
                     pass
@@ -159,7 +133,7 @@ async def handle_client(reader, writer):
     except (asyncio.IncompleteReadError, ConnectionResetError) as e:
         print(f"\x1b[38;2;255;80;80m[!] error: {e}")
     finally:
-        print(f"\x1b[38;2;255;193;79m[-] client {addr} disconnected")
+        print(f"\x1b[38;2;255;193;79m[-] client \x1b[38;2;79;141;255m{addr}\x1b[38;2;255;193;79m disconnected")
         try:
             clients.remove(writer)
         except KeyError:
@@ -171,10 +145,20 @@ async def handle_client(reader, writer):
             pass
             
 async def main():
+    global token_num, token_regen, BLOCK_DURATION, PORT
     parser = argparse.ArgumentParser(prog = "tethernot", description = "Server for EtherNOT")
     parser.add_argument("--regencerts", help="Regenerate certificates to connect clients anew.", action = "store_true")
+    parser.add_argument("--port", help="Choose a port to run tethernot on. Default: 6780")
+    parser.add_argument("--bucket", help="Set the max messages a client can send before being rate limited. Default: 5")
+    parser.add_argument("--bucketfill", help="Set the regeneration rate in seconds (float) of the rate limit \"bucket\". Default: 1.0")
+    parser.add_argument("--blocktime", help="Set time in seconds to block a user after they've been rate limited. Default: 30")
     args = parser.parse_args()
     
+    if args.port: PORT = args.port
+    if args.bucket: token_num = args.bucket
+    if args.bucketfill: token_regen = args.bucketfill
+    if args.blocktime: BLOCK_DURATION = args.blocktime
+
     if args.regencerts:
         shutil.rmtree(CERT_DIR)
         print("\x1b[38;2;79;141;255m[*] Regenerating certificates!")
@@ -198,12 +182,17 @@ async def main():
     
     server = await asyncio.start_server(handle_client, "0.0.0.0", PORT, ssl=ssl_ctx)
     print(f"\x1b[38;2;79;141;255m[*] tethernot is running on localhost, port {PORT}")
-    async with server:
-        await server.serve_forever()
+    try:
+        async with server:
+            await server.serve_forever()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\n\n\x1b[38;2;79;141;255m[*] Exiting tethernot")
+    finally:
+        server.close()
+        await server.wait_closed()
     
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\n\x1b[38;2;79;141;255m[*] Exiting tethernot")
         sys.exit(0)

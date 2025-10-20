@@ -11,6 +11,7 @@ import ssl
 import os
 import hashlib
 from pathlib import Path
+from collections import defaultdict, deque
 
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -31,6 +32,8 @@ users = []
 shutdown_event = asyncio.Event()
 channel = "general"
 channel_list = ["general"]
+local_username = None
+histories = defaultdict(lambda: deque(maxlen=100))
 
 def compute_cert_fingerprint_from_sslobj(sslobj):
     if sslobj is None:
@@ -189,20 +192,36 @@ async def send_loop(writer, username, session):
     color = "#9966FF"
     global channel
     global channel_list
+    global local_username
+    local_username = username
     first_time = True
     try:
         while not shutdown_event.is_set():
             if first_time:
                 first_time = False
-                msg = {
+                msg = { # Send join packet, notify other users you're here
                     "type": "join",
-                    "author": username
+                    "author": username,
+                    "channel": channel
                 }
                 status = await send_msg(writer, msg)
                 if not status:
                     break
-                else:
-                    continue
+                who_req = { # Request packets from other users for usernames
+                    "type": "who_request",
+                    "author": username
+                }
+                status = await send_msg(writer, who_req)
+                if not status:
+                    break
+                hist_req = { # Get history from other channels from one specific user
+                    "type": "history_request",
+                    "author": username,
+                    "channel": channel,
+                    "target": username # non anonymous? maybe have it pick one at random
+                }
+                await send_msg(writer, hist_req)
+                continue
             
             prompt_text = FormattedText([(f"fg:{color}", f"[{username}]"), ("", " >> ")])
             try:
@@ -236,6 +255,7 @@ async def send_loop(writer, username, session):
                     continue
                 new_name = parts[1].strip()
                 if validate_regex(new_name, USERNAME_RE):
+                    local_username = new_name
                     username = new_name
                     if username not in users:
                         users.append(username)
@@ -305,6 +325,13 @@ async def send_loop(writer, username, session):
                     print_formatted_text(FormattedText([
                         ("fg:#51DBBB", f"[i] Moved to ethernot/{parts[1].strip()}"),
                     ]))
+                    hist_req = {
+                        "type": "history_request",
+                        "author": username,
+                        "channel": channel,
+                        "target": username
+                    }
+                    await send_msg(writer, hist_req)
                 else:
                     print_formatted_text(FormattedText([
                         ("fg:#FF4444", f"[!] Channel doesn't appear to exist: {parts[1].strip()}.")
@@ -320,6 +347,16 @@ async def send_loop(writer, username, session):
                 "timestamp": time.time(),
                 "body": body
             }
+            
+            try:
+                histories[channel].append({
+                    "timestamp": msg["timestamp"],
+                    "author": msg["author"],
+                    "color": msg["color"],
+                    "body": msg["body"]
+                })
+            except Exception:
+                pass
             
             status = await send_msg(writer, msg)
             if not status:
@@ -350,6 +387,7 @@ async def send_loop(writer, username, session):
 async def recieve_loop(reader):
     global channel
     global channel_list
+    global local_username
     try:
         while not shutdown_event.is_set():
             try:
@@ -376,15 +414,30 @@ async def recieve_loop(reader):
                     raise ValueError("Message is not an object! (Corrupted or still encrypted?)")
                 msgtype = msg.get("type", "?")
                 
+                def safe_author(m):
+                    return little_bobby_tables(m.get("author", "?"), maxlen = 32)
+                
                 if msgtype == "message":
-                    if msg.get("channel", "?") == channel:
-                        author = little_bobby_tables(msg.get("author", "?"), maxlen = 32)
-                        if author not in users:
-                            users.append(author)
-                        color = msg.get("color", "#9966FF")
-                        if not validate_regex(color, COLOR_RE):
-                            color = "#9966FF"
-                        body = little_bobby_tables(msg.get("body", "")) # check here if this breaks the input
+                    ch = msg.get("channel", "?")
+                    author = safe_author(msg)
+                    if author not in users:
+                        users.append(author)
+                    color = msg.get("color", "#9966FF")
+                    if not validate_regex(color, COLOR_RE):
+                        color = "#9966FF"
+                    body = little_bobby_tables(msg.get("body", ""))
+                    
+                    try:
+                        histories[ch].append({
+                            "timestamp": msg.get("timestamp", time.time()),
+                            "author": author,
+                            "color": color,
+                            "body": body
+                        })
+                    except Exception:
+                        pass
+                    
+                    if ch == channel:
                         print_formatted_text(FormattedText([
                             (f"fg:{color}", f"[{author}]"),
                             ("", f" >> {body}")
@@ -392,14 +445,22 @@ async def recieve_loop(reader):
                         
                 elif msgtype == "newchannel":
                     name = msg.get("name")
-                    if name not in channel_list:
+                    if name and name not in channel_list:
                         channel_list.append(name)
+                    author = safe_author(msg)
+                    if author not in users:
+                        users.append(author)    
                     print_formatted_text(FormattedText([
                         ("fg:#51DBBB", f"[i] {msg.get("author", "?")} created the channel ethernot/{msg.get("name", "?")}!"),
                     ]))
                     
                 elif msgtype == "join":
-                    users.append(msg.get("author", "?"))
+                    author = safe_author(msg)
+                    ch = msg.get("channel")
+                    if author not in users:
+                        users.append(author)
+                    if ch and ch not in channel_list:
+                        channel_list.append(ch)
                     print_formatted_text(FormattedText([
                         ("fg:#51DBBB", f"[+] {msg.get("author", "?")} connected"),
                     ]))
@@ -415,7 +476,63 @@ async def recieve_loop(reader):
                     print_formatted_text(FormattedText([
                         ("fg:#ffc14f", f"[-] {author} left")
                     ]))
-
+                    
+                elif msgtype == "who_request":
+                    requester = msg.get("author")
+                    resp = {
+                        "type": "who_response",
+                        "author": local_username,
+                        "channel": channel,
+                        "channels": "channel_list",
+                        "target": requester
+                    }
+                    if local_username and local_username not in users:
+                        users.append(local_username)
+                        
+                    outgoing_responses.append(resp) # recieve loop can't directly send messages so we set up another writer loop and a queue
+                    pass
+                    
+                elif msgtype == "history_request":
+                    req_channel = msg.get("channel")
+                    requester = msg.get("author")
+                    msgs = list(histories.get(req_channel, []))
+                    hist_resp = { # hopefully send a channel-specific packet, need to remove byte limit on this one!!!
+                        "type": "history_response",
+                        "author": local_username,
+                        "channel": req_channel,
+                        "messages": msgs,
+                        "target": requester
+                    }
+                    outgoing_responses.append(hist_resp)
+                
+                elif msgtype == "history_response":
+                    target = msg.get("target")
+                    resp_channel = msg.get("channel")
+                    messages = msg.get("messages", [])
+                    sender = safe_author(msg)
+                    if resp_channel and resp_channel not in channel_list:
+                        channel_list.append(resp_channel)
+                    try:
+                        for m in messages:
+                            histories[resp_channel].append({
+                                "timestamp": m.get("timestamp", time.time()),
+                                "author": m.get("author", "?"),
+                                "color": m.get("color", "#9966FF"),
+                                "body": m.get("body", "")
+                            })
+                    except Exception:
+                        pass
+                    if target == local_username and resp_channel == channel:
+                        for m in list(histories[resp_channel]):
+                            author = m.get("author", "?")
+                            body = m.get("body", "")
+                            color = m.get("color", "#9966FF")
+                            print_formatted_text(FormattedText([
+                                (f"fg:{color}", f"[{author}]"),
+                                ("", f" >> {body}")
+                            ]))
+                else:
+                    print(msgtype, "< Unknown message type, outdated client?")
                     
             except json.JSONDecodeError as e:
                 print_formatted_text(FormattedText(["fg:#FF4444", f"[!] malformed message: {e}"]))
@@ -428,6 +545,8 @@ async def recieve_loop(reader):
 def handle_sigint():
     if not shutdown_event.is_set():
         shutdown_event.set()
+
+outgoing_responses = []
 
 async def main():
     parser = argparse.ArgumentParser(prog="ethernot", description="EtherNOT CLI Client")
@@ -506,6 +625,24 @@ async def main():
         pass
 
     session = PromptSession()
+    
+    async def send_loop_with_outbox(writer, username, session):
+        send_task = asyncio.create_task(send_loop(writer, username, session))
+        try:
+            while not shutdown_event.is_set():
+                while outgoing_responses:
+                    resp = outgoing_responses.pop(0)
+                    if not resp.get("author"):
+                        resp["author"] = local_username or username
+                        await send_msg(writer, resp)
+                    await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if not send_task.done():
+                send_task.cancel()
+            await asyncio.gather(send_task, return_exceptions=True)
+    
     with patch_stdout():
         send_task = asyncio.create_task(send_loop(writer, username, session))
         recv_task = asyncio.create_task(recieve_loop(reader))

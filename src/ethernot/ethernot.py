@@ -195,6 +195,7 @@ async def send_loop(writer, username, session):
     global local_username
     local_username = username
     first_time = True
+    
     try:
         while not shutdown_event.is_set():
             if first_time:
@@ -388,6 +389,7 @@ async def recieve_loop(reader):
     global channel
     global channel_list
     global local_username
+    
     try:
         while not shutdown_event.is_set():
             try:
@@ -483,7 +485,7 @@ async def recieve_loop(reader):
                         "type": "who_response",
                         "author": local_username,
                         "channel": channel,
-                        "channels": "channel_list",
+                        "channels": channel_list,
                         "target": requester
                     }
                     if local_username and local_username not in users:
@@ -509,7 +511,6 @@ async def recieve_loop(reader):
                     target = msg.get("target")
                     resp_channel = msg.get("channel")
                     messages = msg.get("messages", [])
-                    sender = safe_author(msg)
                     if resp_channel and resp_channel not in channel_list:
                         channel_list.append(resp_channel)
                     try:
@@ -627,30 +628,29 @@ async def main():
     session = PromptSession()
     
     async def send_loop_with_outbox(writer, username, session):
-        send_task = asyncio.create_task(send_loop(writer, username, session))
         try:
             while not shutdown_event.is_set():
-                while outgoing_responses:
+                if outgoing_responses:
                     resp = outgoing_responses.pop(0)
                     if not resp.get("author"):
                         resp["author"] = local_username or username
-                        await send_msg(writer, resp)
+                    await send_msg(writer, resp)
                     await asyncio.sleep(0.1)
+                else:
+                    await asyncio.sleep(0.1) # delay will add latency but prevent spinning while loop, oh well
         except asyncio.CancelledError:
             pass
-        finally:
-            if not send_task.done():
-                send_task.cancel()
-            await asyncio.gather(send_task, return_exceptions=True)
     
     with patch_stdout():
-        send_task = asyncio.create_task(send_loop(writer, username, session))
         recv_task = asyncio.create_task(recieve_loop(reader))
+        send_task = asyncio.create_task(send_loop(writer, username, session))
+        out_send_task = asyncio.create_task(send_loop_with_outbox(writer, username, session))
+
         await shutdown_event.wait()
-        for t in (send_task, recv_task):
+        for t in (send_task, recv_task, out_send_task):
             if not t.done():
                 t.cancel()
-        await asyncio.gather(send_task, recv_task, return_exceptions=True)
+        await asyncio.gather(send_task, recv_task, out_send_task, return_exceptions=True)
 
     try:
         writer.close()

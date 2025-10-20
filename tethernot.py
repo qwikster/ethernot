@@ -7,6 +7,7 @@ import ipaddress
 import argparse
 import shutil
 import time
+import json
 from collections import defaultdict
 
 from cryptography import x509 # i hate myself
@@ -103,13 +104,22 @@ async def handle_client(reader, writer):
             data = await reader.readline()
             if not data:
                 break
+            
+            msg = data.decode().strip()
+            pkt_type = None
+            try:
+                pkt = json.loads(msg)
+                pkt_type = pkt.get("type")
+            except Exception:
+                pkt_type = None
+            
+            if pkt_type == "message":
+                bucket = buckets[addr] # VERY RISKY but i'm out of time and history requests are causing rate limits
 
-            bucket = buckets[addr]
-
-            if not bucket.consume():
-                print(f"\x1b[38;2;255;80;80m[!] Client \x1b[38;2;79;141;255m{addr}\x1b[38;2;255;80;80m exceeded rate limit, disconnecting")
-                blocklist[addr] = now + BLOCK_DURATION
-                break
+                if not bucket.consume():
+                    print(f"\x1b[38;2;255;80;80m[!] Client \x1b[38;2;79;141;255m{addr}\x1b[38;2;255;80;80m exceeded rate limit, disconnecting")
+                    blocklist[addr] = now + BLOCK_DURATION
+                    break
 
             broken = []
             

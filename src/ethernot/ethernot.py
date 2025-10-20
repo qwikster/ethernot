@@ -10,6 +10,7 @@ import re
 import ssl
 import os
 import hashlib
+from datetime import datetime
 from pathlib import Path
 from collections import defaultdict, deque
 
@@ -32,6 +33,10 @@ users = []
 shutdown_event = asyncio.Event()
 channel = "general"
 channel_list = ["general"]
+
+last_hist_request = 0
+hist_req_inprog = False
+
 local_username = None
 histories = defaultdict(lambda: deque(maxlen=100))
 
@@ -142,9 +147,9 @@ def print_help():
         ("", "Get a list of all joinable channels. You're in ethernot/general by default.\n"),
         ("fg:#51DBBB", "[/join channel | /switch channel] > "),
         ("", "Change to a channel. Use [/list] to see which exist\n"),
-        ("fg:#51DBBB", "[/create CHANNEL] > "),
+        ("fg:#51DBBB", "[/create | /channel CHANNEL] > "),
         ("", "Create a channel and switch to it. Careful - irreversable, except by closing all clients.\n"),
-        ("fg:#51DBBB", "[/who] > "),
+        ("fg:#51DBBB", "[/who | /online] > "),
         ("", "List currently online users\n"),
     ]))
 
@@ -222,9 +227,13 @@ async def send_loop(writer, username, session):
                     "target": username # non anonymous? maybe have it pick one at random
                 }
                 await send_msg(writer, hist_req)
+                
+                global hist_req_inprog, last_hist_request # avoid multiple clients
+                hist_req_inprog = True
+                last_hist_request = time.time()
                 continue
             
-            prompt_text = FormattedText([(f"fg:{color}", f"[{username}]"), ("", " >> ")])
+            prompt_text = FormattedText([(f"fg:{color}", f"(You) [{username}]"), ("", " >> ")])
             try:
                 line = await session.prompt_async(prompt_text)
             except (KeyboardInterrupt, EOFError, asyncio.CancelledError):
@@ -241,7 +250,7 @@ async def send_loop(writer, username, session):
                 print_help()
                 continue
             
-            elif line == "/who":
+            elif line == "/who" or line == "/online":
                 list_users()
                 continue
             
@@ -285,7 +294,7 @@ async def send_loop(writer, username, session):
                     ]))
                 continue
             
-            elif line.startswith("/create"):
+            elif line.startswith("/create") or line.startswith("/channel"):
                 parts = line.split(maxsplit=1)
                 if len(parts) != 2:
                     print_formatted_text(FormattedText([("fg:#FF4444", "[!] Usage: /create <channel>")]))
@@ -310,7 +319,7 @@ async def send_loop(writer, username, session):
                         ("fg:#FF4444", f"[!] Invalid channel name: {parts[1].strip()}.")
                     ]))
                     
-            elif line == "/list":
+            elif line == "/list" or line == "/channels":
                 channellist = "], [ethernot/".join(channel_list)
                 the = ("[ethernot/" + channellist + "]")
                 print(the)
@@ -324,7 +333,7 @@ async def send_loop(writer, username, session):
                 if parts[1].strip() in channel_list:
                     channel = parts[1].strip()
                     print_formatted_text(FormattedText([
-                        ("fg:#51DBBB", f"[i] Moved to ethernot/{parts[1].strip()}"),
+                        ("fg:#51DBBB", f"\n\n\n[i] Moved to ethernot/{parts[1].strip()}"),
                     ]))
                     hist_req = {
                         "type": "history_request",
@@ -333,6 +342,7 @@ async def send_loop(writer, username, session):
                         "target": username
                     }
                     await send_msg(writer, hist_req)
+                    hist_req_inprog = True
                 else:
                     print_formatted_text(FormattedText([
                         ("fg:#FF4444", f"[!] Channel doesn't appear to exist: {parts[1].strip()}.")
@@ -389,6 +399,7 @@ async def recieve_loop(reader):
     global channel
     global channel_list
     global local_username
+    global last_hist_request
     
     try:
         while not shutdown_event.is_set():
@@ -422,12 +433,14 @@ async def recieve_loop(reader):
                 if msgtype == "message":
                     ch = msg.get("channel", "?")
                     author = safe_author(msg)
+                    ts = msg.get("timestamp", "?:?")
                     if author not in users:
                         users.append(author)
                     color = msg.get("color", "#9966FF")
                     if not validate_regex(color, COLOR_RE):
                         color = "#9966FF"
                     body = little_bobby_tables(msg.get("body", ""))
+                    
                     
                     try:
                         histories[ch].append({
@@ -441,7 +454,7 @@ async def recieve_loop(reader):
                     
                     if ch == channel:
                         print_formatted_text(FormattedText([
-                            (f"fg:{color}", f"[{author}]"),
+                            (f"fg:{color}", f"[{datetime.fromtimestamp(ts).astimezone().strftime("%H:%M:%S")}] [{author}]"),
                             ("", f" >> {body}")
                         ]))
                         
@@ -511,27 +524,85 @@ async def recieve_loop(reader):
                     target = msg.get("target")
                     resp_channel = msg.get("channel")
                     messages = msg.get("messages", [])
+                    
                     if resp_channel and resp_channel not in channel_list:
                         channel_list.append(resp_channel)
-                    try:
-                        for m in messages:
-                            histories[resp_channel].append({
-                                "timestamp": m.get("timestamp", time.time()),
-                                "author": m.get("author", "?"),
+                    
+                    global hist_req_inprog, last_hist_request
+                    if hist_req_inprog:
+                        hist_req_inprog = False
+                        # avoid race conditions + hopefully avoid duplicate prints
+                    else:
+                        hist_req_inprog = False
+                        continue
+                    
+                    existing = set((m["author"], float(m["timestamp"]), m["body"]) for m in histories[resp_channel])
+                    
+                    new_msgs = []
+                    
+                    for m in messages:
+                        author = m.get("author", "?")
+                        ts = m.get("timestamp", None)
+                        body = m.get("body", "")
+                        try:
+                            ts = float(ts) if ts is not None else time.time()
+                        except Exception:
+                            ts = time.time()
+                            
+                        key = (author, ts, body)
+                        
+                        if key not in existing:
+                            new_msgs.append({
+                                "timestamp": ts,
+                                "author": author,
                                 "color": m.get("color", "#9966FF"),
-                                "body": m.get("body", "")
+                                "body": body
                             })
-                    except Exception:
-                        pass
+                            existing.add(key)
+                                
+                    merged = list(histories[resp_channel]) + new_msgs
+                    for item in merged:
+                        if not isinstance(item.get("timestamp"), (int, float)):
+                            try:
+                                item["timestamp"] = float(item.get("timestamp", time.time()))
+                            except Exception:
+                                item["timestamp"] = time.time()
+                    merged.sort(key=lambda x: x.get("timestamp", 0))
+                    
+                    maxlen = 100
+                    if len(merged) > maxlen:
+                        merged = merged[-maxlen:]
+                    
+                    histories[resp_channel] = deque(merged, maxlen=maxlen)
+                        
                     if target == local_username and resp_channel == channel:
-                        for m in list(histories[resp_channel]):
+                        for m in histories[resp_channel]:
                             author = m.get("author", "?")
                             body = m.get("body", "")
+                            ts = m.get("timestamp", 0)
                             color = m.get("color", "#9966FF")
+                            try:
+                                timestr = datetime.fromtimestamp(float(ts)).astimezone().strftime("%H:%M:%S")
+                            except Exception:
+                                timestr = "??:??:??"
+
                             print_formatted_text(FormattedText([
-                                (f"fg:{color}", f"[{author}]"),
+                                (f"fg:{color}", f"[{timestr}] [{author}]"),
                                 ("", f" >> {body}")
                             ]))
+                        print_formatted_text(FormattedText([
+                            ("fg:#7DFFF4", "--- Present ---"),
+                        ]))
+                    
+                elif msgtype == "who_response":
+                    author = msg.get("author")
+                    ch_list = msg.get("channels", [])
+                    if author and author not in users:
+                        users.append(author)
+                    for ch in ch_list:
+                        if ch not in channel_list:
+                            channel_list.append(ch)
+                    
                 else:
                     print(msgtype, "< Unknown message type, outdated client?")
                     
@@ -616,7 +687,7 @@ async def main():
         return
                 
     set_loading_anim(False)
-    print(f"\x1b[38;2;79;141;255m[*] Connected to {server}:{SERVER_PORT} as {username}")
+    print(f"\x1b[38;2;79;141;255m[*] Connected to {server}:{SERVER_PORT} as {username}!\n\nRun /help for help.")
 
     loop = asyncio.get_running_loop()
     try:

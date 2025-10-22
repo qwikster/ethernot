@@ -2,6 +2,9 @@
 Super-simple encrypted command line text messaging where messages are stored only in the memory of all computers connected.
 > pronounced like "ethernet" but... not
 
+## demo
+https://github.com/user-attachments/assets/2d454dfa-0340-41fa-b359-8b925c60f703
+
 ## installation
 `pip install ethernot` (or pipx if you so require)
 
